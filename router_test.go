@@ -3621,6 +3621,253 @@ func TestPathValues_GetOr(t *testing.T) {
 	}
 }
 
+func TestMethodToSlot(t *testing.T) {
+	knownMethods := []struct {
+		method   string
+		wantSlot methodSlot
+	}{
+		{http.MethodConnect, mCONNECT},
+		{http.MethodDelete, mDELETE},
+		{http.MethodGet, mGET},
+		{http.MethodHead, mHEAD},
+		{http.MethodOptions, mOPTIONS},
+		{http.MethodPatch, mPATCH},
+		{http.MethodPost, mPOST},
+		{PROPFIND, mPROPFIND},
+		{http.MethodPut, mPUT},
+		{http.MethodTrace, mTRACE},
+		{REPORT, mREPORT},
+		{RouteAny, mANY},
+	}
+	for _, tc := range knownMethods {
+		slot, ok := methodToSlot(tc.method)
+		assert.True(t, ok, "expected known method: %s", tc.method)
+		assert.Equal(t, tc.wantSlot, slot, "wrong slot for method: %s", tc.method)
+	}
+
+	// Unknown / custom methods must return false
+	for _, m := range []string{"COPY", "LOCK", "CUSTOM", RouteNotFound, ""} {
+		_, ok := methodToSlot(m)
+		assert.False(t, ok, "expected unknown method: %s", m)
+	}
+}
+
+func TestRouteMethods_setAndFindStandardMethods(t *testing.T) {
+	methods := []string{
+		http.MethodConnect, http.MethodDelete, http.MethodGet,
+		http.MethodHead, http.MethodOptions, http.MethodPatch,
+		http.MethodPost, PROPFIND, http.MethodPut,
+		http.MethodTrace, REPORT,
+	}
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			m := new(routeMethods)
+			rm := &routeMethod{
+				RouteInfo: &RouteInfo{Method: method, Path: "/test"},
+				handler:   handlerFunc,
+			}
+			m.set(method, rm)
+
+			assert.Equal(t, rm, m.find(method, false), "find should return the set handler")
+			assert.True(t, m.isHandler(), "isHandler should be true after setting a standard method")
+			assert.Contains(t, m.allowHeader, method, "Allow header should contain the method")
+			assert.True(t, strings.HasPrefix(m.allowHeader, http.MethodOptions), "Allow header should start with OPTIONS")
+		})
+	}
+}
+
+func TestRouteMethods_setAndFindCustomMethod(t *testing.T) {
+	m := new(routeMethods)
+	rm := &routeMethod{
+		RouteInfo: &RouteInfo{Method: "CUSTOM", Path: "/test"},
+		handler:   handlerFunc,
+	}
+	m.set("CUSTOM", rm)
+
+	assert.Equal(t, rm, m.find("CUSTOM", false))
+	assert.True(t, m.isHandler())
+	assert.Contains(t, m.allowHeader, "CUSTOM")
+
+	// Unknown method not registered returns nil
+	assert.Nil(t, m.find("NONEXISTENT", false))
+}
+
+func TestRouteMethods_anyFallback(t *testing.T) {
+	m := new(routeMethods)
+	anyRM := &routeMethod{
+		RouteInfo: &RouteInfo{Method: RouteAny, Path: "/test"},
+		handler:   handlerFunc,
+	}
+	m.set(RouteAny, anyRM)
+
+	// Direct RouteAny lookup
+	assert.Equal(t, anyRM, m.find(RouteAny, false))
+
+	// Fallback to any when method not found
+	assert.Equal(t, anyRM, m.find(http.MethodGet, true), "should fall back to any handler")
+	assert.Equal(t, anyRM, m.find("CUSTOM", true), "custom methods should also fall back to any handler")
+
+	// No fallback when fallbackToAny is false
+	assert.Nil(t, m.find(http.MethodGet, false), "should not fall back when fallbackToAny is false")
+
+	// Explicit handler takes priority over any
+	getRM := &routeMethod{
+		RouteInfo: &RouteInfo{Method: http.MethodGet, Path: "/test"},
+		handler:   handlerFunc,
+	}
+	m.set(http.MethodGet, getRM)
+	assert.Equal(t, getRM, m.find(http.MethodGet, true), "explicit handler should take priority over any")
+	assert.Equal(t, anyRM, m.find(http.MethodPost, true), "unregistered methods should still fall back to any")
+}
+
+func TestRouteMethods_routeNotFoundNotCountedAsHandler(t *testing.T) {
+	m := new(routeMethods)
+	rm := &routeMethod{
+		RouteInfo: &RouteInfo{Method: RouteNotFound, Path: "/test"},
+		handler:   handlerFunc,
+	}
+	m.set(RouteNotFound, rm)
+
+	assert.False(t, m.isHandler(), "RouteNotFound should not count as a handler")
+	assert.Equal(t, rm, m.find(RouteNotFound, false), "should find RouteNotFound handler")
+	assert.Equal(t, "", m.allowHeader, "RouteNotFound should not affect Allow header")
+}
+
+func TestRouteMethods_allowHeaderContent(t *testing.T) {
+	t.Run("single method", func(t *testing.T) {
+		m := new(routeMethods)
+		m.set(http.MethodGet, &routeMethod{
+			RouteInfo: &RouteInfo{Method: http.MethodGet, Path: "/"},
+			handler:   handlerFunc,
+		})
+		assert.Equal(t, "OPTIONS, GET", m.allowHeader)
+	})
+
+	t.Run("multiple standard methods in fixed order", func(t *testing.T) {
+		m := new(routeMethods)
+		// Register in reverse order to prove output order is fixed, not insertion order
+		for _, method := range []string{http.MethodPost, http.MethodGet, http.MethodDelete} {
+			m.set(method, &routeMethod{
+				RouteInfo: &RouteInfo{Method: method, Path: "/"},
+				handler:   handlerFunc,
+			})
+		}
+		assert.Equal(t, "OPTIONS, DELETE, GET, POST", m.allowHeader)
+	})
+
+	t.Run("RouteAny expands all standard methods", func(t *testing.T) {
+		m := new(routeMethods)
+		m.set(RouteAny, &routeMethod{
+			RouteInfo: &RouteInfo{Method: RouteAny, Path: "/"},
+			handler:   handlerFunc,
+		})
+		expected := "OPTIONS, CONNECT, DELETE, GET, HEAD, PATCH, POST, PROPFIND, PUT, TRACE, REPORT"
+		assert.Equal(t, expected, m.allowHeader)
+	})
+
+	t.Run("custom methods in sorted order", func(t *testing.T) {
+		m := new(routeMethods)
+		for _, method := range []string{"ZEBRA", "ALPHA", "MIDDLE"} {
+			m.set(method, &routeMethod{
+				RouteInfo: &RouteInfo{Method: method, Path: "/"},
+				handler:   handlerFunc,
+			})
+		}
+		assert.Equal(t, "OPTIONS, ALPHA, MIDDLE, ZEBRA", m.allowHeader)
+	})
+
+	t.Run("standard and custom methods together", func(t *testing.T) {
+		m := new(routeMethods)
+		m.set(http.MethodGet, &routeMethod{
+			RouteInfo: &RouteInfo{Method: http.MethodGet, Path: "/"},
+			handler:   handlerFunc,
+		})
+		m.set("COPY", &routeMethod{
+			RouteInfo: &RouteInfo{Method: "COPY", Path: "/"},
+			handler:   handlerFunc,
+		})
+		m.set("LOCK", &routeMethod{
+			RouteInfo: &RouteInfo{Method: "LOCK", Path: "/"},
+			handler:   handlerFunc,
+		})
+		assert.Equal(t, "OPTIONS, GET, COPY, LOCK", m.allowHeader)
+	})
+}
+
+func TestRouteMethods_isHandler(t *testing.T) {
+	t.Run("empty is not handler", func(t *testing.T) {
+		m := new(routeMethods)
+		assert.False(t, m.isHandler())
+	})
+
+	t.Run("standard method is handler", func(t *testing.T) {
+		m := new(routeMethods)
+		m.set(http.MethodGet, &routeMethod{
+			RouteInfo: &RouteInfo{Method: http.MethodGet, Path: "/"},
+			handler:   handlerFunc,
+		})
+		assert.True(t, m.isHandler())
+	})
+
+	t.Run("RouteAny is handler", func(t *testing.T) {
+		m := new(routeMethods)
+		m.set(RouteAny, &routeMethod{
+			RouteInfo: &RouteInfo{Method: RouteAny, Path: "/"},
+			handler:   handlerFunc,
+		})
+		assert.True(t, m.isHandler())
+	})
+
+	t.Run("custom method is handler", func(t *testing.T) {
+		m := new(routeMethods)
+		m.set("CUSTOM", &routeMethod{
+			RouteInfo: &RouteInfo{Method: "CUSTOM", Path: "/"},
+			handler:   handlerFunc,
+		})
+		assert.True(t, m.isHandler())
+	})
+
+	t.Run("only RouteNotFound is not handler", func(t *testing.T) {
+		m := new(routeMethods)
+		m.set(RouteNotFound, &routeMethod{
+			RouteInfo: &RouteInfo{Method: RouteNotFound, Path: "/"},
+			handler:   handlerFunc,
+		})
+		assert.False(t, m.isHandler())
+	})
+}
+
+func TestRouteMethods_removeHandler(t *testing.T) {
+	t.Run("remove standard method", func(t *testing.T) {
+		m := new(routeMethods)
+		m.set(http.MethodGet, &routeMethod{
+			RouteInfo: &RouteInfo{Method: http.MethodGet, Path: "/"},
+			handler:   handlerFunc,
+		})
+		assert.True(t, m.isHandler())
+		assert.Equal(t, "OPTIONS, GET", m.allowHeader)
+
+		m.set(http.MethodGet, nil)
+		assert.False(t, m.isHandler())
+		assert.Nil(t, m.find(http.MethodGet, false))
+		assert.Equal(t, "OPTIONS", m.allowHeader)
+	})
+
+	t.Run("remove custom method", func(t *testing.T) {
+		m := new(routeMethods)
+		rm := &routeMethod{
+			RouteInfo: &RouteInfo{Method: "CUSTOM", Path: "/"},
+			handler:   handlerFunc,
+		}
+		m.set("CUSTOM", rm)
+		assert.True(t, m.isHandler())
+
+		m.set("CUSTOM", &routeMethod{RouteInfo: &RouteInfo{}, handler: nil})
+		assert.False(t, m.isHandler())
+		assert.Nil(t, m.find("CUSTOM", false))
+	})
+}
+
 func BenchmarkRouterStaticRoutes(b *testing.B) {
 	benchmarkRouterRoutes(b, staticRoutes, staticRoutes)
 }
