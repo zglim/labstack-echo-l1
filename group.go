@@ -75,15 +75,10 @@ func (g *Group) Any(path string, handler HandlerFunc, middleware ...MiddlewareFu
 
 // Match implements `Echo#Match()` for sub-routes within the Group. Panics on error.
 func (g *Group) Match(methods []string, path string, handler HandlerFunc, middleware ...MiddlewareFunc) Routes {
-	errs := make([]error, 0)
-	ris := make(Routes, 0)
+	ris := make(Routes, 0, len(methods))
+	var errs []error
 	for _, m := range methods {
-		ri, err := g.AddRoute(Route{
-			Method:      m,
-			Path:        path,
-			Handler:     handler,
-			Middlewares: middleware,
-		})
+		ri, err := g.add(m, path, handler, middleware...)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -120,12 +115,7 @@ func (g *Group) Static(pathPrefix, fsRoot string, middleware ...MiddlewareFunc) 
 // prefix for directory path. This is necessary as `//go:embed assets/images` embeds files with paths
 // including `assets/images` as their prefix.
 func (g *Group) StaticFS(pathPrefix string, filesystem fs.FS, middleware ...MiddlewareFunc) RouteInfo {
-	return g.Add(
-		http.MethodGet,
-		pathPrefix+"*",
-		StaticDirectoryHandler(filesystem, false),
-		middleware...,
-	)
+	return g.Add(http.MethodGet, pathPrefix+"*", StaticDirectoryHandler(filesystem, false), middleware...)
 }
 
 // FileFS implements `Echo#FileFS()` for sub-routes within the Group.
@@ -133,7 +123,7 @@ func (g *Group) StaticFS(pathPrefix string, filesystem fs.FS, middleware ...Midd
 // Avoid using the leading `/` slash as most of the Go standard library fs.FS implementations require relative paths for
 // file operations.
 func (g *Group) FileFS(path, file string, filesystem fs.FS, m ...MiddlewareFunc) RouteInfo {
-	return g.GET(path, StaticFileHandler(file, filesystem), m...)
+	return g.Add(http.MethodGet, path, StaticFileHandler(file, filesystem), m...)
 }
 
 // File implements `Echo#File()` for sub-routes within the Group. Panics on error.
@@ -141,10 +131,7 @@ func (g *Group) FileFS(path, file string, filesystem fs.FS, m ...MiddlewareFunc)
 // Avoid using the leading `/` slash as most of the Go standard library fs.FS implementations require relative paths for
 // file operations.
 func (g *Group) File(path, file string, middleware ...MiddlewareFunc) RouteInfo {
-	handler := func(c *Context) error {
-		return c.File(file)
-	}
-	return g.Add(http.MethodGet, path, handler, middleware...)
+	return g.Add(http.MethodGet, path, fileHandler(file), middleware...)
 }
 
 // RouteNotFound implements `Echo#RouteNotFound()` for sub-routes within the Group.
@@ -156,12 +143,7 @@ func (g *Group) RouteNotFound(path string, h HandlerFunc, m ...MiddlewareFunc) R
 
 // Add implements `Echo#Add()` for sub-routes within the Group. Panics on error.
 func (g *Group) Add(method, path string, handler HandlerFunc, middleware ...MiddlewareFunc) RouteInfo {
-	ri, err := g.AddRoute(Route{
-		Method:      method,
-		Path:        path,
-		Handler:     handler,
-		Middlewares: middleware,
-	})
+	ri, err := g.add(method, path, handler, middleware...)
 	if err != nil {
 		panic(err) // this is how `v4` handles errors. `v5` has methods to have panic-free usage
 	}
@@ -175,4 +157,23 @@ func (g *Group) AddRoute(route Route) (RouteInfo, error) {
 	// middleware from earlier calls.
 	groupRoute := route.WithPrefix(g.prefix, append([]MiddlewareFunc{}, g.middleware...))
 	return g.echo.add(groupRoute)
+}
+
+// add is the internal, non-panicking entry point for registering a route on this group.
+// It assembles the Route and delegates to AddRoute which applies the group prefix and middleware.
+// All public registration methods (Add, Match, HTTP-method shortcuts, static helpers) funnel through here.
+func (g *Group) add(method, path string, handler HandlerFunc, middleware ...MiddlewareFunc) (RouteInfo, error) {
+	return g.AddRoute(Route{
+		Method:      method,
+		Path:        path,
+		Handler:     handler,
+		Middlewares: middleware,
+	})
+}
+
+// fileHandler creates a HandlerFunc that serves the given file from the Echo instance's filesystem.
+func fileHandler(file string) HandlerFunc {
+	return func(c *Context) error {
+		return c.File(file)
+	}
 }

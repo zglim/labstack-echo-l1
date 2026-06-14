@@ -812,3 +812,325 @@ func TestGroup_RouteNotFoundWithMiddleware(t *testing.T) {
 		})
 	}
 }
+
+func TestGroup_GET(t *testing.T) {
+	e := New()
+
+	users := e.Group("/users")
+	ri := users.GET("/list", func(c *Context) error {
+		return c.String(http.StatusTeapot, "OK")
+	})
+
+	assert.Equal(t, http.MethodGet, ri.Method)
+	assert.Equal(t, "/users/list", ri.Path)
+	assert.Equal(t, http.MethodGet+":/users/list", ri.Name)
+	assert.Nil(t, ri.Parameters)
+
+	status, body := request(http.MethodGet, "/users/list", e)
+	assert.Equal(t, http.StatusTeapot, status)
+	assert.Equal(t, `OK`, body)
+}
+
+func TestGroup_Add(t *testing.T) {
+	e := New()
+	g := e.Group("/api")
+
+	ri := g.Add(http.MethodPost, "/items", func(c *Context) error {
+		return c.String(http.StatusCreated, "created")
+	})
+
+	assert.Equal(t, http.MethodPost, ri.Method)
+	assert.Equal(t, "/api/items", ri.Path)
+
+	status, body := request(http.MethodPost, "/api/items", e)
+	assert.Equal(t, http.StatusCreated, status)
+	assert.Equal(t, "created", body)
+}
+
+func TestGroup_AddPanicsOnDuplicate(t *testing.T) {
+	e := New()
+	g := e.Group("/api")
+	h := func(c *Context) error { return nil }
+
+	g.GET("/dup", h)
+
+	assert.Panics(t, func() {
+		g.GET("/dup", h)
+	})
+}
+
+func TestGroup_AddRoute(t *testing.T) {
+	e := New()
+	g := e.Group("/api")
+
+	ri, err := g.AddRoute(Route{
+		Method:  http.MethodPut,
+		Path:    "/items",
+		Handler: func(c *Context) error { return c.String(http.StatusOK, "updated") },
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, http.MethodPut, ri.Method)
+	assert.Equal(t, "/api/items", ri.Path)
+
+	status, body := request(http.MethodPut, "/api/items", e)
+	assert.Equal(t, http.StatusOK, status)
+	assert.Equal(t, "updated", body)
+}
+
+func TestGroup_AddRouteReturnsErrorOnDuplicate(t *testing.T) {
+	e := New()
+	g := e.Group("/api")
+
+	h := func(c *Context) error { return nil }
+	_, err := g.AddRoute(Route{Method: http.MethodGet, Path: "/x", Handler: h})
+	assert.NoError(t, err)
+
+	_, err = g.AddRoute(Route{Method: http.MethodGet, Path: "/x", Handler: h})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "duplicate route")
+}
+
+func TestGroup_AddRouteAppliesGroupMiddleware(t *testing.T) {
+	e := New()
+
+	mwCalled := false
+	g := e.Group("/api", func(next HandlerFunc) HandlerFunc {
+		return func(c *Context) error {
+			mwCalled = true
+			return next(c)
+		}
+	})
+
+	_, err := g.AddRoute(Route{
+		Method:  http.MethodGet,
+		Path:    "/check",
+		Handler: func(c *Context) error { return c.String(http.StatusOK, "ok") },
+	})
+	assert.NoError(t, err)
+
+	status, _ := request(http.MethodGet, "/api/check", e)
+	assert.Equal(t, http.StatusOK, status)
+	assert.True(t, mwCalled)
+}
+
+func TestGroup_MatchEmptyMethods(t *testing.T) {
+	e := New()
+	g := e.Group("/api")
+
+	ris := g.Match([]string{}, "/items", func(c *Context) error {
+		return c.String(http.StatusOK, "ok")
+	})
+	assert.Empty(t, ris)
+}
+
+func TestGroup_AnyRespondsToAllMethods(t *testing.T) {
+	e := New()
+	g := e.Group("/api")
+	g.Any("/resource", func(c *Context) error {
+		return c.String(http.StatusOK, c.Request().Method)
+	})
+
+	for _, method := range []string{
+		http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete,
+		http.MethodPatch, http.MethodHead, http.MethodOptions, http.MethodTrace,
+		http.MethodConnect,
+	} {
+		status, body := request(method, "/api/resource", e)
+		assert.Equal(t, http.StatusOK, status, "method: %s", method)
+		assert.Equal(t, method, body, "method: %s", method)
+	}
+}
+
+func TestGroup_NestedGroupMiddlewareInheritance(t *testing.T) {
+	e := New()
+
+	var order []string
+
+	mwA := func(next HandlerFunc) HandlerFunc {
+		return func(c *Context) error {
+			order = append(order, "A")
+			return next(c)
+		}
+	}
+	mwB := func(next HandlerFunc) HandlerFunc {
+		return func(c *Context) error {
+			order = append(order, "B")
+			return next(c)
+		}
+	}
+	mwC := func(next HandlerFunc) HandlerFunc {
+		return func(c *Context) error {
+			order = append(order, "C")
+			return next(c)
+		}
+	}
+
+	api := e.Group("/api", mwA)
+	v1 := api.Group("/v1", mwB)
+	v1.GET("/hello", func(c *Context) error {
+		order = append(order, "handler")
+		return c.String(http.StatusOK, "hi")
+	}, mwC)
+
+	status, body := request(http.MethodGet, "/api/v1/hello", e)
+	assert.Equal(t, http.StatusOK, status)
+	assert.Equal(t, "hi", body)
+	// Middleware should execute in order: group A, group B, route-level C, then handler
+	assert.Equal(t, []string{"A", "B", "C", "handler"}, order)
+}
+
+func TestGroup_NestedGroupPrefix(t *testing.T) {
+	e := New()
+
+	a := e.Group("/a")
+	b := a.Group("/b")
+	c := b.Group("/c")
+	c.GET("/d", func(c *Context) error {
+		return c.String(http.StatusOK, "deep")
+	})
+
+	status, body := request(http.MethodGet, "/a/b/c/d", e)
+	assert.Equal(t, http.StatusOK, status)
+	assert.Equal(t, "deep", body)
+}
+
+func TestGroup_StaticFS(t *testing.T) {
+	e := New()
+	g := e.Group("/assets")
+
+	ri := g.StaticFS("/files", os.DirFS("_fixture"))
+	assert.Equal(t, http.MethodGet, ri.Method)
+	assert.Equal(t, "/assets/files*", ri.Path)
+
+	req := httptest.NewRequest(http.MethodGet, "/assets/files/index.html", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.True(t, strings.HasPrefix(rec.Body.String(), "<!doctype html>"))
+}
+
+func TestGroup_FileRouteInfo(t *testing.T) {
+	e := New()
+	g := e.Group("/dl")
+
+	ri := g.File("/logo", "_fixture/images/walle.png")
+	assert.Equal(t, http.MethodGet, ri.Method)
+	assert.Equal(t, "/dl/logo", ri.Path)
+	assert.Equal(t, "GET:/dl/logo", ri.Name)
+
+	req := httptest.NewRequest(http.MethodGet, "/dl/logo", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestGroup_FileFSRouteInfo(t *testing.T) {
+	e := New()
+	g := e.Group("/dl")
+
+	ri := g.FileFS("/logo", "walle.png", os.DirFS("_fixture/images"))
+	assert.Equal(t, http.MethodGet, ri.Method)
+	assert.Equal(t, "/dl/logo", ri.Path)
+
+	req := httptest.NewRequest(http.MethodGet, "/dl/logo", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestGroup_UseAddsMiddlewareToGroup(t *testing.T) {
+	e := New()
+	g := e.Group("/api")
+
+	called := false
+	g.Use(func(next HandlerFunc) HandlerFunc {
+		return func(c *Context) error {
+			called = true
+			return next(c)
+		}
+	})
+	g.GET("/ping", func(c *Context) error {
+		return c.String(http.StatusOK, "pong")
+	})
+
+	status, body := request(http.MethodGet, "/api/ping", e)
+	assert.Equal(t, http.StatusOK, status)
+	assert.Equal(t, "pong", body)
+	assert.True(t, called)
+}
+
+func TestGroup_HTTPMethodShortcutsPrefixApplied(t *testing.T) {
+	// Verify all HTTP method shortcuts apply the group prefix correctly.
+	methods := []struct {
+		name   string
+		method string
+		reg    func(g *Group, path string, h HandlerFunc) RouteInfo
+	}{
+		{"CONNECT", http.MethodConnect, func(g *Group, p string, h HandlerFunc) RouteInfo { return g.CONNECT(p, h) }},
+		{"DELETE", http.MethodDelete, func(g *Group, p string, h HandlerFunc) RouteInfo { return g.DELETE(p, h) }},
+		{"GET", http.MethodGet, func(g *Group, p string, h HandlerFunc) RouteInfo { return g.GET(p, h) }},
+		{"HEAD", http.MethodHead, func(g *Group, p string, h HandlerFunc) RouteInfo { return g.HEAD(p, h) }},
+		{"OPTIONS", http.MethodOptions, func(g *Group, p string, h HandlerFunc) RouteInfo { return g.OPTIONS(p, h) }},
+		{"PATCH", http.MethodPatch, func(g *Group, p string, h HandlerFunc) RouteInfo { return g.PATCH(p, h) }},
+		{"POST", http.MethodPost, func(g *Group, p string, h HandlerFunc) RouteInfo { return g.POST(p, h) }},
+		{"PUT", http.MethodPut, func(g *Group, p string, h HandlerFunc) RouteInfo { return g.PUT(p, h) }},
+		{"TRACE", http.MethodTrace, func(g *Group, p string, h HandlerFunc) RouteInfo { return g.TRACE(p, h) }},
+	}
+
+	for _, tc := range methods {
+		t.Run(tc.name, func(t *testing.T) {
+			e := New()
+			g := e.Group("/pfx")
+			h := func(c *Context) error { return c.String(http.StatusOK, tc.name) }
+
+			ri := tc.reg(g, "/test", h)
+			assert.Equal(t, tc.method, ri.Method)
+			assert.Equal(t, "/pfx/test", ri.Path)
+		})
+	}
+}
+
+func TestGroup_RouteNotFoundPrefixApplied(t *testing.T) {
+	e := New()
+	g := e.Group("/api")
+
+	ri := g.RouteNotFound("/*", func(c *Context) error {
+		return c.NoContent(http.StatusNotFound)
+	})
+	assert.Equal(t, RouteNotFound, ri.Method)
+	assert.Equal(t, "/api/*", ri.Path)
+}
+
+func TestGroup_AddRouteWithRouteMiddleware(t *testing.T) {
+	e := New()
+
+	groupMW := false
+	routeMW := false
+
+	g := e.Group("/api", func(next HandlerFunc) HandlerFunc {
+		return func(c *Context) error {
+			groupMW = true
+			return next(c)
+		}
+	})
+
+	_, err := g.AddRoute(Route{
+		Method:  http.MethodGet,
+		Path:    "/test",
+		Handler: func(c *Context) error { return c.String(http.StatusOK, "ok") },
+		Middlewares: []MiddlewareFunc{
+			func(next HandlerFunc) HandlerFunc {
+				return func(c *Context) error {
+					routeMW = true
+					return next(c)
+				}
+			},
+		},
+	})
+	assert.NoError(t, err)
+
+	status, _ := request(http.MethodGet, "/api/test", e)
+	assert.Equal(t, http.StatusOK, status)
+	assert.True(t, groupMW, "group middleware should be called")
+	assert.True(t, routeMW, "route middleware should be called")
+}
