@@ -458,27 +458,32 @@ func (c *Context) String(code int, s string) (err error) {
 	return c.Blob(code, MIMETextPlainCharsetUTF8, []byte(s))
 }
 
-func (c *Context) jsonPBlob(code int, callback string, i any) (err error) {
+// writeJSONP writes a JSONP response by wrapping the output of writeContent
+// in a JavaScript callback function call: "callback(<content>);".
+// Content-Type is set to application/javascript, and the status code is
+// committed immediately before writing the callback wrapper.
+func (c *Context) writeJSONP(code int, callback string, writeContent func() error) error {
 	c.writeContentType(MIMEApplicationJavaScriptCharsetUTF8)
 	c.response.WriteHeader(code)
-	if _, err = c.response.Write([]byte(callback + "(")); err != nil {
-		return
+	if _, err := c.response.Write([]byte(callback + "(")); err != nil {
+		return err
 	}
-	if err = c.echo.JSONSerializer.Serialize(c, i, ""); err != nil {
-		return
+	if err := writeContent(); err != nil {
+		return err
 	}
-	if _, err = c.response.Write([]byte(");")); err != nil {
-		return
-	}
-	return
+	_, err := c.response.Write([]byte(");"))
+	return err
 }
 
+// json writes a JSON response using the configured JSONSerializer. Unlike the blob path
+// (Blob/HTMLBlob/JSONBlob etc.) which commits the status code immediately, this method
+// wraps the response writer with delayedStatusWriter so the status code is only sent on
+// the first Write call from the serializer. This ensures that if serialization fails
+// (e.g. unsupported type), no status code has been committed yet, allowing the global
+// error handler to choose an appropriate error code instead.
 func (c *Context) json(code int, i any, indent string) error {
 	c.writeContentType(MIMEApplicationJSON)
 
-	// as JSONSerializer.Serialize can fail, and in that case we need to delay sending status code to the client until
-	// (global) error handler decides correct status code for the error to be sent to the client.
-	// For that we need to use writer that can store the proposed status code until the first Write is called.
 	resp := c.Response()
 	c.SetResponse(&delayedStatusWriter{ResponseWriter: resp, status: code})
 	defer c.SetResponse(resp)
@@ -503,57 +508,59 @@ func (c *Context) JSONBlob(code int, b []byte) (err error) {
 
 // JSONP sends a JSONP response with status code. It uses `callback` to construct
 // the JSONP payload.
-func (c *Context) JSONP(code int, callback string, i any) (err error) {
-	return c.jsonPBlob(code, callback, i)
+func (c *Context) JSONP(code int, callback string, i any) error {
+	return c.writeJSONP(code, callback, func() error {
+		return c.echo.JSONSerializer.Serialize(c, i, "")
+	})
 }
 
 // JSONPBlob sends a JSONP blob response with status code. It uses `callback`
 // to construct the JSONP payload.
-func (c *Context) JSONPBlob(code int, callback string, b []byte) (err error) {
-	c.writeContentType(MIMEApplicationJavaScriptCharsetUTF8)
-	c.response.WriteHeader(code)
-	if _, err = c.response.Write([]byte(callback + "(")); err != nil {
-		return
-	}
-	if _, err = c.response.Write(b); err != nil {
-		return
-	}
-	_, err = c.response.Write([]byte(");"))
-	return
+func (c *Context) JSONPBlob(code int, callback string, b []byte) error {
+	return c.writeJSONP(code, callback, func() error {
+		_, err := c.response.Write(b)
+		return err
+	})
 }
 
-func (c *Context) xml(code int, i any, indent string) (err error) {
+// writeXML writes an XML response with the standard XML declaration header,
+// then delegates body writing to writeContent. Content-Type is set to
+// application/xml and the status code is committed before any content.
+func (c *Context) writeXML(code int, writeContent func() error) error {
 	c.writeContentType(MIMEApplicationXMLCharsetUTF8)
 	c.response.WriteHeader(code)
-	enc := xml.NewEncoder(c.response)
-	if indent != "" {
-		enc.Indent("", indent)
+	if _, err := c.response.Write([]byte(xml.Header)); err != nil {
+		return err
 	}
-	if _, err = c.response.Write([]byte(xml.Header)); err != nil {
-		return
-	}
-	return enc.Encode(i)
+	return writeContent()
+}
+
+func (c *Context) xml(code int, i any, indent string) error {
+	return c.writeXML(code, func() error {
+		enc := xml.NewEncoder(c.response)
+		if indent != "" {
+			enc.Indent("", indent)
+		}
+		return enc.Encode(i)
+	})
 }
 
 // XML sends an XML response with status code.
-func (c *Context) XML(code int, i any) (err error) {
+func (c *Context) XML(code int, i any) error {
 	return c.xml(code, i, "")
 }
 
 // XMLPretty sends a pretty-print XML with status code.
-func (c *Context) XMLPretty(code int, i any, indent string) (err error) {
+func (c *Context) XMLPretty(code int, i any, indent string) error {
 	return c.xml(code, i, indent)
 }
 
 // XMLBlob sends an XML blob response with status code.
-func (c *Context) XMLBlob(code int, b []byte) (err error) {
-	c.writeContentType(MIMEApplicationXMLCharsetUTF8)
-	c.response.WriteHeader(code)
-	if _, err = c.response.Write([]byte(xml.Header)); err != nil {
-		return
-	}
-	_, err = c.response.Write(b)
-	return
+func (c *Context) XMLBlob(code int, b []byte) error {
+	return c.writeXML(code, func() error {
+		_, err := c.response.Write(b)
+		return err
+	})
 }
 
 // Blob sends a blob response with status code and content type.

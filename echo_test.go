@@ -6,6 +6,7 @@ package echo
 import (
 	"bytes"
 	stdContext "context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1231,6 +1232,73 @@ func TestDefaultHTTPErrorHandler_CommitedResponse(t *testing.T) {
 
 	errHandler(c, errors.New("my_error"))
 	assert.Equal(t, http.StatusOK, resp.Code)
+}
+
+func TestBuildErrorResponse(t *testing.T) {
+	var testCases = []struct {
+		whenError        error
+		name             string
+		expectBody       string
+		expectCode       int
+		givenExposeError bool
+	}{
+		{
+			name:       "HTTPError with message",
+			whenError:  &HTTPError{Code: http.StatusTeapot, Message: "my_error"},
+			expectCode: http.StatusTeapot,
+			expectBody: `{"message":"my_error"}`,
+		},
+		{
+			name:       "HTTPError without message falls back to status text",
+			whenError:  &HTTPError{Code: http.StatusTeapot, Message: ""},
+			expectCode: http.StatusTeapot,
+			expectBody: `{"message":"I'm a teapot"}`,
+		},
+		{
+			name:             "HTTPError with wrapped error exposed",
+			givenExposeError: true,
+			whenError:        HTTPError{Code: http.StatusTeapot, Message: "my_error"}.Wrap(errors.New("internal")),
+			expectCode:       http.StatusTeapot,
+			expectBody:       `{"error":"internal","message":"my_error"}`,
+		},
+		{
+			name:             "HTTPError with wrapped error not exposed",
+			givenExposeError: false,
+			whenError:        HTTPError{Code: http.StatusTeapot, Message: "my_error"}.Wrap(errors.New("internal")),
+			expectCode:       http.StatusTeapot,
+			expectBody:       `{"message":"my_error"}`,
+		},
+		{
+			name:       "plain error without expose",
+			whenError:  errors.New("something broke"),
+			expectCode: http.StatusInternalServerError,
+			expectBody: `{"message":"Internal Server Error"}`,
+		},
+		{
+			name:             "plain error with expose",
+			givenExposeError: true,
+			whenError:        errors.New("something broke"),
+			expectCode:       http.StatusInternalServerError,
+			expectBody:       `{"error":"something broke","message":"Internal Server Error"}`,
+		},
+		{
+			name:       "custom error with json.Marshaler and HTTPStatusCoder",
+			whenError:  &customError{Code: http.StatusTeapot, Message: "custom"},
+			expectCode: http.StatusTeapot,
+			expectBody: `{"x":"custom"}`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, result := buildErrorResponse(tc.whenError, tc.givenExposeError)
+			assert.Equal(t, tc.expectCode, code)
+
+			b, err := json.Marshal(result)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expectBody, string(b))
+		})
+	}
 }
 
 func benchmarkEchoRoutes(b *testing.B, routes []testRoute) {

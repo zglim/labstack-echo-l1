@@ -377,47 +377,62 @@ func DefaultHTTPErrorHandler(exposeError bool) HTTPErrorHandler {
 			return
 		}
 
-		code := http.StatusInternalServerError
-		var sc HTTPStatusCoder
-		if errors.As(err, &sc) {
-			if tmp := sc.StatusCode(); tmp != 0 {
-				code = tmp
-			}
-		}
+		code, result := buildErrorResponse(err, exposeError)
 
-		var result any
-		switch m := sc.(type) {
-		case json.Marshaler: // this type knows how to format itself to JSON
-			result = m
-		case *HTTPError:
-			sText := m.Message
-			if sText == "" {
-				sText = http.StatusText(code)
-			}
-			msg := map[string]any{"message": sText}
-			if exposeError {
-				if wrappedErr := m.Unwrap(); wrappedErr != nil {
-					msg["error"] = wrappedErr.Error()
-				}
-			}
-			result = msg
-		default:
-			msg := map[string]any{"message": http.StatusText(code)}
-			if exposeError {
-				msg["error"] = err.Error()
-			}
-			result = msg
-		}
-
+		// Send the error response using Context's own response methods.
+		// HEAD requests receive an empty body per HTTP spec (Issue #608),
+		// while all other methods get a JSON-encoded error body. The JSON
+		// path uses the delayed-status-writer pattern (see Context.json),
+		// so a serialization failure here would not commit a wrong status code.
 		var cErr error
-		if c.Request().Method == http.MethodHead { // Issue #608
+		if c.Request().Method == http.MethodHead {
 			cErr = c.NoContent(code)
 		} else {
 			cErr = c.JSON(code, result)
 		}
 		if cErr != nil {
-			c.Logger().Error("echo default error handler failed to send error to client", "error", cErr) // truly rare case. ala client already disconnected
+			c.Logger().Error("echo default error handler failed to send error to client", "error", cErr)
 		}
+	}
+}
+
+// buildErrorResponse resolves an error into an HTTP status code and a JSON-serializable
+// response body. It handles three cases in priority order:
+//   - json.Marshaler: the error controls its own JSON representation (used as-is)
+//   - *HTTPError: message is extracted (falls back to status text if empty),
+//     and the wrapped error is optionally exposed
+//   - all other errors: a generic message from http.StatusText is returned,
+//     with the raw error string optionally exposed
+func buildErrorResponse(err error, exposeError bool) (int, any) {
+	code := http.StatusInternalServerError
+	var sc HTTPStatusCoder
+	if errors.As(err, &sc) {
+		if tmp := sc.StatusCode(); tmp != 0 {
+			code = tmp
+		}
+	}
+
+	switch m := sc.(type) {
+	case json.Marshaler:
+		return code, m
+	case *HTTPError:
+		sText := m.Message
+		if sText == "" {
+			sText = http.StatusText(code)
+		}
+		msg := map[string]any{"message": sText}
+		if exposeError {
+			if wrappedErr := m.Unwrap(); wrappedErr != nil {
+				msg["error"] = wrappedErr.Error()
+			}
+		}
+		return code, msg
+	default:
+		msg := map[string]any{"message": http.StatusText(code)}
+		if exposeError {
+			msg["error"] = err.Error()
+		}
+		return code, msg
 	}
 }
 

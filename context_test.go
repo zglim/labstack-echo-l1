@@ -1541,3 +1541,172 @@ func TestRouteInfo(t *testing.T) {
 	orgRI.Name = "changed"
 	assert.NotEqual(t, expect, c.RouteInfo())
 }
+
+func TestContextString(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	c := NewContext(req, rec)
+
+	err := c.String(http.StatusOK, "Hello, World!")
+	if assert.NoError(t, err) {
+		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, MIMETextPlainCharsetUTF8, rec.Header().Get(HeaderContentType))
+		assert.Equal(t, "Hello, World!", rec.Body.String())
+	}
+}
+
+func TestContextStringWithCustomStatus(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	c := NewContext(req, rec)
+
+	err := c.String(http.StatusCreated, "created")
+	if assert.NoError(t, err) {
+		assert.Equal(t, http.StatusCreated, rec.Code)
+		assert.Equal(t, MIMETextPlainCharsetUTF8, rec.Header().Get(HeaderContentType))
+		assert.Equal(t, "created", rec.Body.String())
+	}
+}
+
+func TestContextHTMLWithCustomStatus(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	c := NewContext(req, rec)
+
+	err := c.HTML(http.StatusNotFound, "<h1>Not Found</h1>")
+	if assert.NoError(t, err) {
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+		assert.Equal(t, MIMETextHTMLCharsetUTF8, rec.Header().Get(HeaderContentType))
+		assert.Equal(t, "<h1>Not Found</h1>", rec.Body.String())
+	}
+}
+
+func TestContextJSONPrettySerializeError(t *testing.T) {
+	e := New()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	c := e.NewContext(req, rec)
+
+	err := c.JSONPretty(http.StatusOK, make(chan bool), "  ")
+	assert.EqualError(t, err, "json: unsupported type: chan bool")
+
+	assert.Equal(t, http.StatusOK, rec.Code) // status code must not be sent to the client
+	assert.Empty(t, rec.Body.String())       // body must not be sent to the client
+}
+
+func TestContextJSONPSerializeError(t *testing.T) {
+	e := New()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	c := e.NewContext(req, rec)
+
+	// JSONP commits status immediately (no delayed writer), so status is written even on error
+	err := c.JSONP(http.StatusOK, "cb", make(chan bool))
+	assert.Error(t, err)
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestContextBlob(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	c := NewContext(req, rec)
+
+	data := []byte{0x01, 0x02, 0x03}
+	err := c.Blob(http.StatusOK, MIMEOctetStream, data)
+	if assert.NoError(t, err) {
+		assert.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, MIMEOctetStream, rec.Header().Get(HeaderContentType))
+		assert.Equal(t, data, rec.Body.Bytes())
+	}
+}
+
+func TestContextWriteContentTypePreservesExisting(t *testing.T) {
+	var testCases = []struct {
+		name     string
+		presetCT string
+		method   func(c *Context) error
+		expectCT string
+	}{
+		{
+			name:     "HTML preserves pre-set Content-Type",
+			presetCT: "text/plain",
+			method: func(c *Context) error {
+				return c.HTML(http.StatusOK, "<p>hi</p>")
+			},
+			expectCT: "text/plain",
+		},
+		{
+			name:     "JSON preserves pre-set Content-Type",
+			presetCT: "application/xml",
+			method: func(c *Context) error {
+				return c.JSON(http.StatusOK, map[string]string{"a": "b"})
+			},
+			expectCT: "application/xml",
+		},
+		{
+			name:     "String preserves pre-set Content-Type",
+			presetCT: "text/csv",
+			method: func(c *Context) error {
+				return c.String(http.StatusOK, "a,b,c")
+			},
+			expectCT: "text/csv",
+		},
+		{
+			name:     "Blob preserves pre-set Content-Type",
+			presetCT: "image/png",
+			method: func(c *Context) error {
+				return c.Blob(http.StatusOK, MIMEOctetStream, []byte{0x89, 0x50})
+			},
+			expectCT: "image/png",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := New()
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			c := e.NewContext(req, rec)
+
+			c.Response().Header().Set(HeaderContentType, tc.presetCT)
+			err := tc.method(c)
+
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expectCT, rec.Header().Get(HeaderContentType))
+		})
+	}
+}
+
+func TestContextRenderSetsHTMLContentType(t *testing.T) {
+	e := New()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	c := e.NewContext(req, rec)
+
+	tmpl := &Template{
+		templates: template.Must(template.New("hello").Parse("Hello, {{.}}!")),
+	}
+	e.Renderer = tmpl
+	err := c.Render(http.StatusOK, "hello", "Jon Snow")
+	if assert.NoError(t, err) {
+		assert.Equal(t, MIMETextHTMLCharsetUTF8, rec.Header().Get(HeaderContentType))
+		assert.Equal(t, http.StatusOK, rec.Code)
+	}
+}
+
+func TestContextRenderWithCustomStatus(t *testing.T) {
+	e := New()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	c := e.NewContext(req, rec)
+
+	tmpl := &Template{
+		templates: template.Must(template.New("hello").Parse("Hello, {{.}}!")),
+	}
+	e.Renderer = tmpl
+	err := c.Render(http.StatusCreated, "hello", "Jon Snow")
+	if assert.NoError(t, err) {
+		assert.Equal(t, http.StatusCreated, rec.Code)
+		assert.Equal(t, "Hello, Jon Snow!", rec.Body.String())
+	}
+}
