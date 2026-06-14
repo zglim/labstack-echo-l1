@@ -8,7 +8,38 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"sort"
 )
+
+// knownMethods lists all HTTP methods (standard + extended) that have dedicated
+// storage slots in routeMethods. The order determines the output order of the
+// Allow header. RouteAny and RouteNotFound are intentionally excluded:
+//   - RouteAny is a wildcard fallback, not a real HTTP method
+//   - RouteNotFound is a 404 handler, not a real HTTP method
+const numMethodSlots = 11
+
+var knownMethods = [numMethodSlots]string{
+	http.MethodConnect,  // 0
+	http.MethodDelete,   // 1
+	http.MethodGet,      // 2
+	http.MethodHead,     // 3
+	http.MethodOptions,  // 4
+	http.MethodPatch,    // 5
+	http.MethodPost,     // 6
+	PROPFIND,            // 7
+	http.MethodPut,      // 8
+	http.MethodTrace,    // 9
+	REPORT,              // 10
+}
+
+// methodIndex maps method name to its slot index in routeMethods.methods.
+var methodIndex = func() map[string]int {
+	m := make(map[string]int, numMethodSlots)
+	for i, method := range knownMethods {
+		m[method] = i
+	}
+	return m
+}()
 
 // Router is interface for routing request contexts to registered routes.
 //
@@ -146,18 +177,16 @@ type routeMethod struct {
 }
 
 type routeMethods struct {
-	connect  *routeMethod
-	delete   *routeMethod
-	get      *routeMethod
-	head     *routeMethod
-	options  *routeMethod
-	patch    *routeMethod
-	post     *routeMethod
-	propfind *routeMethod
-	put      *routeMethod
-	trace    *routeMethod
-	report   *routeMethod
-	any      *routeMethod
+	// methods stores handlers for the known HTTP methods (see knownMethods for ordering).
+	methods [numMethodSlots]*routeMethod
+
+	// any is the fallback handler registered via RouteAny. It matches any HTTP
+	// method when no method-specific handler is found (lower priority than
+	// method-specific handlers).
+	any *routeMethod
+
+	// anyOther stores handlers for custom/non-standard HTTP methods that are
+	// not in the knownMethods list (e.g. COPY, LOCK, MKCOL).
 	anyOther map[string]*routeMethod
 
 	// notFoundHandler is handler registered with RouteNotFound method and is executed for 404 cases
@@ -170,41 +199,23 @@ type routeMethods struct {
 
 func (m *routeMethods) set(method string, r *routeMethod) {
 	switch method {
-	case http.MethodConnect:
-		m.connect = r
-	case http.MethodDelete:
-		m.delete = r
-	case http.MethodGet:
-		m.get = r
-	case http.MethodHead:
-		m.head = r
-	case http.MethodOptions:
-		m.options = r
-	case http.MethodPatch:
-		m.patch = r
-	case http.MethodPost:
-		m.post = r
-	case PROPFIND:
-		m.propfind = r
-	case http.MethodPut:
-		m.put = r
-	case http.MethodTrace:
-		m.trace = r
-	case REPORT:
-		m.report = r
 	case RouteAny:
 		m.any = r
 	case RouteNotFound:
 		m.notFoundHandler = r
 		return // RouteNotFound/404 is not considered as a handler so no further logic needs to be executed
 	default:
-		if m.anyOther == nil {
-			m.anyOther = make(map[string]*routeMethod)
-		}
-		if r.handler == nil {
-			delete(m.anyOther, method)
+		if idx, ok := methodIndex[method]; ok {
+			m.methods[idx] = r
 		} else {
-			m.anyOther[method] = r
+			if m.anyOther == nil {
+				m.anyOther = make(map[string]*routeMethod)
+			}
+			if r.handler == nil {
+				delete(m.anyOther, method)
+			} else {
+				m.anyOther[method] = r
+			}
 		}
 	}
 	m.updateAllowHeader()
@@ -213,34 +224,16 @@ func (m *routeMethods) set(method string, r *routeMethod) {
 func (m *routeMethods) find(method string, fallbackToAny bool) *routeMethod {
 	var r *routeMethod
 	switch method {
-	case http.MethodConnect:
-		r = m.connect
-	case http.MethodDelete:
-		r = m.delete
-	case http.MethodGet:
-		r = m.get
-	case http.MethodHead:
-		r = m.head
-	case http.MethodOptions:
-		r = m.options
-	case http.MethodPatch:
-		r = m.patch
-	case http.MethodPost:
-		r = m.post
-	case PROPFIND:
-		r = m.propfind
-	case http.MethodPut:
-		r = m.put
-	case http.MethodTrace:
-		r = m.trace
-	case REPORT:
-		r = m.report
 	case RouteAny:
 		r = m.any
 	case RouteNotFound:
 		r = m.notFoundHandler
 	default:
-		r = m.anyOther[method]
+		if idx, ok := methodIndex[method]; ok {
+			r = m.methods[idx]
+		} else {
+			r = m.anyOther[method]
+		}
 	}
 	if r != nil || !fallbackToAny {
 		return r
@@ -250,68 +243,52 @@ func (m *routeMethods) find(method string, fallbackToAny bool) *routeMethod {
 
 func (m *routeMethods) updateAllowHeader() {
 	buf := new(bytes.Buffer)
-	buf.WriteString(http.MethodOptions)
-	hasAnyMethod := m.any != nil
+	hasAny := m.any != nil
 
-	if hasAnyMethod || m.connect != nil {
-		buf.WriteString(", ")
-		buf.WriteString(http.MethodConnect)
+	// OPTIONS is always listed first as the base of the Allow header.
+	buf.WriteString(http.MethodOptions)
+
+	// Add known methods in their canonical order (same order as knownMethods).
+	// Skip OPTIONS since it is already included above.
+	for i, method := range knownMethods {
+		if method == http.MethodOptions {
+			continue
+		}
+		if hasAny || m.methods[i] != nil {
+			buf.WriteString(", ")
+			buf.WriteString(method)
+		}
 	}
-	if hasAnyMethod || m.delete != nil {
-		buf.WriteString(", ")
-		buf.WriteString(http.MethodDelete)
+
+	// Add custom methods in sorted order for deterministic output.
+	if len(m.anyOther) > 0 {
+		customMethods := make([]string, 0, len(m.anyOther))
+		for method := range m.anyOther {
+			customMethods = append(customMethods, method)
+		}
+		sort.Strings(customMethods)
+		for _, method := range customMethods {
+			buf.WriteString(", ")
+			buf.WriteString(method)
+		}
 	}
-	if hasAnyMethod || m.get != nil {
-		buf.WriteString(", ")
-		buf.WriteString(http.MethodGet)
-	}
-	if hasAnyMethod || m.head != nil {
-		buf.WriteString(", ")
-		buf.WriteString(http.MethodHead)
-	}
-	if hasAnyMethod || m.patch != nil {
-		buf.WriteString(", ")
-		buf.WriteString(http.MethodPatch)
-	}
-	if hasAnyMethod || m.post != nil {
-		buf.WriteString(", ")
-		buf.WriteString(http.MethodPost)
-	}
-	if hasAnyMethod || m.propfind != nil {
-		buf.WriteString(", PROPFIND")
-	}
-	if hasAnyMethod || m.put != nil {
-		buf.WriteString(", ")
-		buf.WriteString(http.MethodPut)
-	}
-	if hasAnyMethod || m.trace != nil {
-		buf.WriteString(", ")
-		buf.WriteString(http.MethodTrace)
-	}
-	if hasAnyMethod || m.report != nil {
-		buf.WriteString(", REPORT")
-	}
-	for method := range m.anyOther { // for simplicity, we use map and therefore order is not deterministic here
-		buf.WriteString(", ")
-		buf.WriteString(method)
-	}
+
 	m.allowHeader = buf.String()
 }
 
 func (m *routeMethods) isHandler() bool {
-	return m.get != nil ||
-		m.post != nil ||
-		m.options != nil ||
-		m.put != nil ||
-		m.delete != nil ||
-		m.connect != nil ||
-		m.head != nil ||
-		m.patch != nil ||
-		m.propfind != nil ||
-		m.trace != nil ||
-		m.report != nil ||
-		m.any != nil ||
-		len(m.anyOther) != 0
+	for _, rm := range m.methods {
+		if rm != nil {
+			return true
+		}
+	}
+	if m.any != nil {
+		return true
+	}
+	if len(m.anyOther) > 0 {
+		return true
+	}
+	return false
 	// RouteNotFound/404 is not considered as a handler
 }
 
