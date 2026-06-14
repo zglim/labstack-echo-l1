@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"text/template"
 	"time"
@@ -1540,4 +1541,152 @@ func TestRouteInfo(t *testing.T) {
 	expect = c.RouteInfo()
 	orgRI.Name = "changed"
 	assert.NotEqual(t, expect, c.RouteInfo())
+}
+
+// ---------------------------------------------------------------------------
+// Request data accessor consistency tests
+// ---------------------------------------------------------------------------
+
+func TestContextQueryParamOrConsistency(t *testing.T) {
+	var testCases = []struct {
+		name         string
+		givenURL     string
+		paramName    string
+		defaultValue string
+		expect       string
+	}{
+		{
+			name:         "value exists and is non-empty",
+			givenURL:     "/?search=hello",
+			paramName:    "search",
+			defaultValue: "default",
+			expect:       "hello",
+		},
+		{
+			name:         "value exists but is empty",
+			givenURL:     "/?search=",
+			paramName:    "search",
+			defaultValue: "default",
+			expect:       "default",
+		},
+		{
+			name:         "key does not exist",
+			givenURL:     "/?other=1",
+			paramName:    "search",
+			defaultValue: "default",
+			expect:       "default",
+		},
+		{
+			name:         "no query params at all",
+			givenURL:     "/",
+			paramName:    "search",
+			defaultValue: "default",
+			expect:       "default",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.givenURL, nil)
+			c := NewContext(req, nil)
+			assert.Equal(t, tc.expect, c.QueryParamOr(tc.paramName, tc.defaultValue))
+		})
+	}
+}
+
+func TestContextFormValueOrConsistency(t *testing.T) {
+	var testCases = []struct {
+		name         string
+		formData     url.Values
+		fieldName    string
+		defaultValue string
+		expect       string
+	}{
+		{
+			name:         "value exists and is non-empty",
+			formData:     url.Values{"name": {"Jon"}},
+			fieldName:    "name",
+			defaultValue: "default",
+			expect:       "Jon",
+		},
+		{
+			name:         "value exists but is empty",
+			formData:     url.Values{"name": {""}},
+			fieldName:    "name",
+			defaultValue: "default",
+			expect:       "default",
+		},
+		{
+			name:         "key does not exist",
+			formData:     url.Values{"other": {"val"}},
+			fieldName:    "name",
+			defaultValue: "default",
+			expect:       "default",
+		},
+		{
+			name:         "empty form",
+			formData:     url.Values{},
+			fieldName:    "name",
+			defaultValue: "default",
+			expect:       "default",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := New()
+			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tc.formData.Encode()))
+			req.Header.Add(HeaderContentType, MIMEApplicationForm)
+			c := e.NewContext(req, nil)
+			assert.Equal(t, tc.expect, c.FormValueOr(tc.fieldName, tc.defaultValue))
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Context store safety tests
+// ---------------------------------------------------------------------------
+
+func TestContextStoreAfterReset(t *testing.T) {
+	e := New()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+
+	c.Set("key", "value")
+	assert.Equal(t, "value", c.Get("key"))
+
+	c.Reset(httptest.NewRequest(http.MethodGet, "/", nil), httptest.NewRecorder())
+
+	// After Reset, store is nil. Get should return nil without panic.
+	assert.Nil(t, c.Get("key"))
+
+	// Set should re-initialize nil map.
+	c.Set("new", "data")
+	assert.Equal(t, "data", c.Get("new"))
+}
+
+func TestContextGetSetConcurrent(t *testing.T) {
+	c := NewContext(nil, nil)
+
+	const goroutines = 10
+	const iterations = 100
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines * 2)
+
+	for i := range goroutines {
+		key := fmt.Sprintf("key%d", i)
+		go func() {
+			defer wg.Done()
+			for j := range iterations {
+				c.Set(key, j)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range iterations {
+				_ = c.Get(key)
+			}
+		}()
+	}
+	wg.Wait()
 }

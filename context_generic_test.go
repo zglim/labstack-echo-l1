@@ -4,6 +4,7 @@
 package echo
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -67,4 +68,53 @@ func TestContextGetOrInvalidCast(t *testing.T) {
 	v, err := ContextGetOr[float32](c, "key", float32(999))
 	assert.ErrorIs(t, err, ErrInvalidKeyType)
 	assert.Equal(t, float32(0), v)
+}
+
+// ---------------------------------------------------------------------------
+// Context store: nil-map and concurrency safety for typed accessors
+// ---------------------------------------------------------------------------
+
+func TestContextGetWithNilStore(t *testing.T) {
+	c := NewContext(nil, nil)
+	c.Set("key", int64(123))
+
+	// Manually nil out store to simulate post-Reset state
+	c.store = nil
+
+	v, err := ContextGet[int64](c, "key")
+	assert.ErrorIs(t, err, ErrNonExistentKey)
+	assert.Equal(t, int64(0), v)
+}
+
+func TestContextGetOrWithNilStore(t *testing.T) {
+	c := NewContext(nil, nil)
+	c.store = nil
+
+	v, err := ContextGetOr[int64](c, "key", 999)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(999), v)
+}
+
+func TestContextGetConcurrent(t *testing.T) {
+	c := NewContext(nil, nil)
+	c.Set("key", int64(42))
+
+	var wg sync.WaitGroup
+	wg.Add(20)
+
+	for range 10 {
+		go func() {
+			defer wg.Done()
+			v, err := ContextGet[int64](c, "key")
+			assert.NoError(t, err)
+			assert.Equal(t, int64(42), v)
+		}()
+		go func() {
+			defer wg.Done()
+			v, err := ContextGetOr[int64](c, "missing", 99)
+			assert.NoError(t, err)
+			assert.Equal(t, int64(99), v)
+		}()
+	}
+	wg.Wait()
 }

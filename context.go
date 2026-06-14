@@ -241,6 +241,20 @@ func (c *Context) RouteInfo() RouteInfo {
 	return RouteInfo{}
 }
 
+// ---------------------------------------------------------------------------
+// Request data accessors: path parameters, query parameters, form values.
+// The "Or" variants return a provided default when the value is missing/empty.
+// ---------------------------------------------------------------------------
+
+// stringOr returns value if it is non-empty, otherwise returns defaultValue.
+// Used by QueryParamOr and FormValueOr to provide a consistent fallback pattern.
+func stringOr(value, defaultValue string) string {
+	if value == "" {
+		return defaultValue
+	}
+	return value
+}
+
 // Param returns path parameter by name.
 func (c *Context) Param(name string) string {
 	return c.pathValues.GetOr(name, "")
@@ -307,11 +321,7 @@ func (c *Context) QueryParam(name string) string {
 // Note: QueryParamOr does not distinguish if query had no value by that name or value was empty string
 // This means URLs `/test?search=` and `/test` would both return `1` for `c.QueryParamOr("search", "1")`
 func (c *Context) QueryParamOr(name, defaultValue string) string {
-	value := c.QueryParam(name)
-	if value == "" {
-		value = defaultValue
-	}
-	return value
+	return stringOr(c.QueryParam(name), defaultValue)
 }
 
 // QueryParams returns the query parameters as `url.Values`.
@@ -335,11 +345,7 @@ func (c *Context) FormValue(name string) string {
 // FormValueOr returns the form field value or default value for the provided name.
 // Note: FormValueOr does not distinguish if form had no value by that name or value was empty string
 func (c *Context) FormValueOr(name, defaultValue string) string {
-	value := c.FormValue(name)
-	if value == "" {
-		value = defaultValue
-	}
-	return value
+	return stringOr(c.FormValue(name), defaultValue)
 }
 
 // FormValues returns the form field values as `url.Values`.
@@ -387,12 +393,26 @@ func (c *Context) Cookies() []*http.Cookie {
 	return c.request.Cookies()
 }
 
+// ---------------------------------------------------------------------------
+// Context store: per-request key-value storage with concurrent-safe access.
+// For typed access with error reporting, see ContextGet/ContextGetOr in
+// context_generic.go.
+// ---------------------------------------------------------------------------
+
+// storeGet retrieves a value from the context store under a read lock.
+// Returns the value and whether the key was present. Safe to call on a nil map.
+func (c *Context) storeGet(key string) (any, bool) {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	val, ok := c.store[key]
+	return val, ok
+}
+
 // Get retrieves data from the context.
 // Method returns any(nil) when key does not exist which is different from typed nil (eg. []byte(nil)).
 func (c *Context) Get(key string) any {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
-	return c.store[key]
+	val, _ := c.storeGet(key)
+	return val
 }
 
 // Set saves data in the context.

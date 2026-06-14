@@ -11,13 +11,14 @@ var ErrNonExistentKey = errors.New("non existent key")
 // ErrInvalidKeyType is error that is returned when the value is not castable to expected type.
 var ErrInvalidKeyType = errors.New("invalid key type")
 
-// ContextGet retrieves a value from the context store or ErrNonExistentKey error the key is missing.
-// Returns ErrInvalidKeyType error if the value is not castable to type T.
+// ContextGet retrieves a typed value from the context store.
+// Returns ErrNonExistentKey when the key is missing.
+// Returns ErrInvalidKeyType when the stored value cannot be asserted to type T.
+//
+// This is the typed companion to Context.Get; both share the same underlying
+// store and locking via storeGet.
 func ContextGet[T any](c *Context, key string) (T, error) {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
-
-	val, ok := c.store[key]
+	val, ok := c.storeGet(key)
 	if !ok {
 		var zero T
 		return zero, ErrNonExistentKey
