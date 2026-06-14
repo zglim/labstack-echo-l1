@@ -290,20 +290,49 @@ type Config struct {
 	FormParseMaxMemory int64
 }
 
+// New creates an instance of Echo with all default components.
+func New() *Echo {
+	e := &Echo{}
+	e.initDefaults()
+	return e
+}
+
 // NewWithConfig creates an instance of Echo with given configuration.
+// Zero-value fields in Config are ignored and the corresponding defaults are kept.
 func NewWithConfig(config Config) *Echo {
 	e := New()
+	e.applyConfig(config)
+	return e
+}
+
+// initDefaults sets every configurable component to its default value.
+//
+// When adding a new configurable component to Echo, add its default here
+// and the corresponding override in applyConfig.
+func (e *Echo) initDefaults() {
+	dir, _ := os.Getwd()
+
+	// --- configurable components (mirrored in applyConfig) ---
+	e.Logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	e.Filesystem = NewDefaultFS(dir)
+	e.Binder = &DefaultBinder{}
+	e.JSONSerializer = &DefaultJSONSerializer{}
+	e.HTTPErrorHandler = DefaultHTTPErrorHandler(false)
+	e.router = NewRouter(RouterConfig{})
+	e.formParseMaxMemory = defaultMemory
+
+	// --- internal wiring (depends on the Echo instance) ---
+	e.serveHTTPFunc = e.serveHTTP
+	e.contextPool.New = func() any {
+		return newContext(nil, nil, e)
+	}
+}
+
+// applyConfig overrides default values with non-zero Config fields.
+// The field order matches initDefaults so the two stay in sync.
+func (e *Echo) applyConfig(config Config) {
 	if config.Logger != nil {
 		e.Logger = config.Logger
-	}
-	if config.HTTPErrorHandler != nil {
-		e.HTTPErrorHandler = config.HTTPErrorHandler
-	}
-	if config.Router != nil {
-		e.router = config.Router
-	}
-	if config.OnAddRoute != nil {
-		e.OnAddRoute = config.OnAddRoute
 	}
 	if config.Filesystem != nil {
 		e.Filesystem = config.Filesystem
@@ -311,43 +340,32 @@ func NewWithConfig(config Config) *Echo {
 	if config.Binder != nil {
 		e.Binder = config.Binder
 	}
+	if config.JSONSerializer != nil {
+		e.JSONSerializer = config.JSONSerializer
+	}
+	if config.HTTPErrorHandler != nil {
+		e.HTTPErrorHandler = config.HTTPErrorHandler
+	}
+	if config.Router != nil {
+		e.router = config.Router
+	}
+	if config.FormParseMaxMemory > 0 {
+		e.formParseMaxMemory = config.FormParseMaxMemory
+	}
+
+	// --- optional components (no defaults, nil means unset) ---
+	if config.OnAddRoute != nil {
+		e.OnAddRoute = config.OnAddRoute
+	}
 	if config.Validator != nil {
 		e.Validator = config.Validator
 	}
 	if config.Renderer != nil {
 		e.Renderer = config.Renderer
 	}
-	if config.JSONSerializer != nil {
-		e.JSONSerializer = config.JSONSerializer
-	}
 	if config.IPExtractor != nil {
 		e.IPExtractor = config.IPExtractor
 	}
-	if config.FormParseMaxMemory > 0 {
-		e.formParseMaxMemory = config.FormParseMaxMemory
-	}
-	return e
-}
-
-// New creates an instance of Echo.
-func New() *Echo {
-	dir, _ := os.Getwd()
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	e := &Echo{
-		Logger:             logger,
-		Filesystem:         NewDefaultFS(dir),
-		Binder:             &DefaultBinder{},
-		JSONSerializer:     &DefaultJSONSerializer{},
-		formParseMaxMemory: defaultMemory,
-	}
-
-	e.serveHTTPFunc = e.serveHTTP
-	e.router = NewRouter(RouterConfig{})
-	e.HTTPErrorHandler = DefaultHTTPErrorHandler(false)
-	e.contextPool.New = func() any {
-		return newContext(nil, nil, e)
-	}
-	return e
 }
 
 // NewContext returns a new Context instance.

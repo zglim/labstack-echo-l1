@@ -81,6 +81,126 @@ func TestNewWithConfig(t *testing.T) {
 	assert.Equal(t, `Hello, World!`, rec.Body.String())
 }
 
+func TestNew_DefaultComponents(t *testing.T) {
+	e := New()
+
+	// configurable components with defaults
+	assert.NotNil(t, e.Logger, "Logger should be set")
+	assert.NotNil(t, e.Filesystem, "Filesystem should be set")
+	assert.IsType(t, &DefaultBinder{}, e.Binder, "Binder should be DefaultBinder")
+	assert.IsType(t, &DefaultJSONSerializer{}, e.JSONSerializer, "JSONSerializer should be DefaultJSONSerializer")
+	assert.NotNil(t, e.HTTPErrorHandler, "HTTPErrorHandler should be set")
+	assert.NotNil(t, e.Router(), "Router should be set")
+	assert.Equal(t, int64(32<<20), e.formParseMaxMemory, "formParseMaxMemory should be 32MB")
+
+	// optional components with no defaults
+	assert.Nil(t, e.Validator, "Validator should be nil by default")
+	assert.Nil(t, e.Renderer, "Renderer should be nil by default")
+	assert.Nil(t, e.IPExtractor, "IPExtractor should be nil by default")
+	assert.Nil(t, e.OnAddRoute, "OnAddRoute should be nil by default")
+}
+
+func TestNewWithConfig_ZeroConfigPreservesDefaults(t *testing.T) {
+	def := New()
+	e := NewWithConfig(Config{})
+
+	assert.NotNil(t, e.Logger)
+	assert.NotNil(t, e.Filesystem)
+	assert.IsType(t, &DefaultBinder{}, e.Binder)
+	assert.IsType(t, &DefaultJSONSerializer{}, e.JSONSerializer)
+	assert.NotNil(t, e.HTTPErrorHandler)
+	assert.NotNil(t, e.Router())
+	assert.Equal(t, def.formParseMaxMemory, e.formParseMaxMemory)
+
+	assert.Nil(t, e.Validator)
+	assert.Nil(t, e.Renderer)
+	assert.Nil(t, e.IPExtractor)
+	assert.Nil(t, e.OnAddRoute)
+}
+
+type testBinder struct{}
+
+func (tb *testBinder) Bind(_ *Context, _ any) error { return nil }
+
+type testJSONSerializer struct{}
+
+func (tj *testJSONSerializer) Serialize(_ *Context, _ any, _ string) error { return nil }
+func (tj *testJSONSerializer) Deserialize(_ *Context, _ any) error        { return nil }
+
+type testValidator struct{}
+
+func (tv *testValidator) Validate(_ any) error { return nil }
+
+type testRenderer struct{}
+
+func (tr *testRenderer) Render(_ *Context, _ io.Writer, _ string, _ any) error { return nil }
+
+func TestNewWithConfig_ConfigOverrides(t *testing.T) {
+	customLogger := slog.New(slog.DiscardHandler)
+	customFS := os.DirFS(".")
+	customBinder := &testBinder{}
+	customJSON := &testJSONSerializer{}
+	customRouter := NewRouter(RouterConfig{})
+	customValidator := &testValidator{}
+	customRenderer := &testRenderer{}
+	customIPExtractor := func(_ *http.Request) string { return "1.2.3.4" }
+	customErrorHandler := func(_ *Context, _ error) {}
+	customOnAddRoute := func(_ Route) error { return nil }
+	customFormMemory := int64(64 << 20)
+
+	e := NewWithConfig(Config{
+		Logger:             customLogger,
+		Filesystem:         customFS,
+		Binder:             customBinder,
+		JSONSerializer:     customJSON,
+		Router:             customRouter,
+		Validator:          customValidator,
+		Renderer:           customRenderer,
+		IPExtractor:        customIPExtractor,
+		HTTPErrorHandler:   customErrorHandler,
+		OnAddRoute:         customOnAddRoute,
+		FormParseMaxMemory: customFormMemory,
+	})
+
+	assert.Same(t, customLogger, e.Logger)
+	assert.Same(t, customBinder, e.Binder)
+	assert.Same(t, customJSON, e.JSONSerializer)
+	assert.Same(t, customRouter, e.Router())
+	assert.Same(t, customValidator, e.Validator)
+	assert.Same(t, customRenderer, e.Renderer)
+	assert.Equal(t, customFormMemory, e.formParseMaxMemory)
+	assert.NotNil(t, e.Filesystem)
+	assert.NotNil(t, e.HTTPErrorHandler)
+	assert.NotNil(t, e.IPExtractor)
+	assert.NotNil(t, e.OnAddRoute)
+}
+
+func TestNew_ContextInheritsEchoDefaults(t *testing.T) {
+	e := New()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+
+	assert.Same(t, e.Logger, c.Logger(), "Context Logger should be Echo's Logger")
+	assert.Equal(t, e.formParseMaxMemory, c.formParseMaxMemory, "Context formParseMaxMemory should match Echo")
+}
+
+func TestNewWithConfig_ContextInheritsOverrides(t *testing.T) {
+	customLogger := slog.New(slog.DiscardHandler)
+	customFormMemory := int64(64 << 20)
+
+	e := NewWithConfig(Config{
+		Logger:             customLogger,
+		FormParseMaxMemory: customFormMemory,
+	})
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+
+	assert.Same(t, customLogger, c.Logger(), "Context Logger should be overridden Logger")
+	assert.Equal(t, customFormMemory, c.formParseMaxMemory, "Context formParseMaxMemory should be overridden value")
+}
+
 func TestNewDefaultFS(t *testing.T) {
 	tempDir := t.TempDir()
 	filename := filepath.Join(tempDir, "file.txt")
